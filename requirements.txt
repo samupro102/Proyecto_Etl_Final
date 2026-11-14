@@ -9,3 +9,4 @@ pyarrow>=15.0.0
 requests>=2.31.0
 great-expectations>=0.18.0
 openpyxl
+confluent_kafka

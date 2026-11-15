@@ -1,258 +1,193 @@
+
+import argparse
 import json
 import os
+import signal
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from confluent_kafka import Consumer
+
 import psycopg2
+from confluent_kafka import Consumer, KafkaError
 from dotenv import load_dotenv
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import contract  # noqa: E402
+
 BASE_DIR = Path(__file__).resolve().parent.parent
-TOPIC = "icbf.atencion.reportada"
+SCHEMA_SQL = BASE_DIR / "sql" / "streaming_schema.sql"
+load_dotenv(BASE_DIR / ".env")
 
-load_dotenv()
+_parar = False
 
-# 1. Conexión a PostgreSQL
-try:
+
+def _senal(*_):
+    global _parar
+    _parar = True
+
+
+def conectar_pg():
     conn = psycopg2.connect(
-        dbname=os.getenv("DW_POSTGRES_DB", os.getenv("POSTGRES_DB", "postgres")),       
+        dbname=os.getenv("DW_POSTGRES_DB") or os.getenv("POSTGRES_DB", "postgres"),
         user=os.getenv("POSTGRES_USER", "postgres"),
-        password=os.getenv("POSTGRES_PASSWORD", ""), 
+        password=(os.getenv("POSTGRES_PASSWORD") or "").strip("\"'"),
         host=os.getenv("STREAM_PG_HOST", "localhost"),
-        port=os.getenv("STREAM_PG_PORT", "5433")
+        port=os.getenv("STREAM_PG_PORT", "5433"),
     )
-    conn.autocommit = True
-    cursor = conn.cursor()
-    print("✅ Conexión a PostgreSQL establecida.")
-except Exception as e:
-    print(f"❌ ERROR DETALLADO al conectar a PostgreSQL: {e}")
-    raise SystemExit(1)
+    conn.autocommit = False  # una transacción por evento
+    return conn
 
-# 2. Configuración del Consumidor
-consumer = Consumer({
-    "bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP", "localhost:9094"),
-    "group.id": "icbf-streaming-team",
-    "auto.offset.reset": "earliest",
-})
-consumer.subscribe([TOPIC])
 
-# ============================================================
-# INICIALIZACIÓN DE BASE DE DATOS
-# ============================================================
-def init_db():
-    # 1. Tabla de Eventos Crudos
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS raw_atencion_events (
-            raw_event_id VARCHAR(100) PRIMARY KEY,
-            raw_payload TEXT NOT NULL,
-            received_at TIMESTAMP NOT NULL
-        )
-    """)
-    # 2. Dimensión Ubicación
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS dim_streaming_location (
-            location_id SERIAL PRIMARY KEY,
-            codigo_municipio_dane VARCHAR(50) NOT NULL,
-            departamento VARCHAR(100) NOT NULL,
-            zona VARCHAR(50) NOT NULL,
-            UNIQUE(codigo_municipio_dane, departamento, zona)
-        )
-    """)
-    # 3. Dimensión Estado
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS dim_streaming_status (
-            status_id SERIAL PRIMARY KEY,
-            estado_atencion VARCHAR(100) UNIQUE NOT NULL
-        )
-    """)
-    # 4. Dimensión Fecha (Simplificada para el stream)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS dim_streaming_date (
-            date_id INT PRIMARY KEY, 
-            year INT NOT NULL,
-            month INT NOT NULL,
-            day INT NOT NULL
-        )
-    """)
-    # 5. Tabla de Hechos Streaming
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS fact_atencion_streaming (
-            streaming_id SERIAL PRIMARY KEY,
-            raw_event_id VARCHAR(100) REFERENCES raw_atencion_events(raw_event_id),
-            location_id INT REFERENCES dim_streaming_location(location_id),
-            status_id INT REFERENCES dim_streaming_status(status_id),
-            date_id INT REFERENCES dim_streaming_date(date_id),
-            total_beneficiarios INT NOT NULL,
-            event_timestamp TIMESTAMP,
-            processed_timestamp TIMESTAMP,
-            processing_delay_seconds FLOAT
-        )
-    """)
-    # 6. Tabla de Eventos Rechazados (DLQ)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS rejected_atencion_events (
-            id SERIAL PRIMARY KEY,
-            event_id VARCHAR(100),
-            raw_event TEXT,
-            rejection_reason TEXT,
-            rejected_at TIMESTAMP
-        )
-    """)
-    print("✅ Modelo Dimensional Streaming validado/creado en PostgreSQL.")
+def init_db(conn):
+    with conn.cursor() as cur:
+        cur.execute(SCHEMA_SQL.read_text(encoding="utf-8"))
+    conn.commit()
+    print("✅ Esquema de streaming y vistas de métricas listos.")
 
-# ============================================================
-# FUNCIONES DE PROCESAMIENTO
-# ============================================================
-def validate_event(event):
-    """Valida los campos del evento de acuerdo a las corrupciones inyectadas."""
-    required_fields = [
-        "event_id", "codigo_municipio_dane", "departamento", 
-        "zona", "estado_atencion", "total_beneficiarios", "event_time"
-    ]
 
-    for field in required_fields:
-        if field not in event:
-            return False, f"Missing field: {field}"
-        if event[field] in (None, "") and field != "total_beneficiarios":
-            return False, f"Empty field: {field}"
+def persistir_valido(cur, evento, raw, particion, offset):
+    event_dt = contract.parse_event_time(evento["event_time"])
+    procesado = datetime.now(timezone.utc)
+    retardo = (procesado - event_dt).total_seconds()
+    date_id = int(event_dt.strftime("%Y%m%d"))
 
-    # Validar tipos y rangos (Atrapa inyecciones del productor)
-    if not isinstance(event["total_beneficiarios"], int):
-        return False, "total_beneficiarios must be an integer"
-    if event["total_beneficiarios"] < 0:
-        return False, "total_beneficiarios cannot be negative"
-        
-    if event["zona"] == "ZONA_DESCONOCIDA":
-        return False, "Invalid domain value for zona"
+    cur.execute(
+        """INSERT INTO raw_atencion_events (raw_event_id, raw_payload, kafka_partition, kafka_offset)
+           VALUES (%s, %s, %s, %s) ON CONFLICT (raw_event_id) DO NOTHING""",
+        (evento["event_id"], raw, particion, offset),
+    )
+    cur.execute(
+        """INSERT INTO dim_streaming_date (date_id, year, month, day)
+           VALUES (%s, %s, %s, %s) ON CONFLICT (date_id) DO NOTHING""",
+        (date_id, event_dt.year, event_dt.month, event_dt.day),
+    )
+    cur.execute(
+        """INSERT INTO dim_streaming_location (codigo_municipio_dane, departamento, zona)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (codigo_municipio_dane, departamento, zona) DO NOTHING""",
+        (evento["codigo_municipio_dane"], evento["departamento"], evento["zona"]),
+    )
+    cur.execute(
+        """SELECT location_id FROM dim_streaming_location
+           WHERE codigo_municipio_dane=%s AND departamento=%s AND zona=%s""",
+        (evento["codigo_municipio_dane"], evento["departamento"], evento["zona"]),
+    )
+    location_id = cur.fetchone()[0]
+    cur.execute(
+        """INSERT INTO dim_streaming_status (estado_atencion) VALUES (%s)
+           ON CONFLICT (estado_atencion) DO NOTHING""",
+        (evento["estado_atencion"],),
+    )
+    cur.execute("SELECT status_id FROM dim_streaming_status WHERE estado_atencion=%s",
+                (evento["estado_atencion"],))
+    status_id = cur.fetchone()[0]
 
-    if not str(event["codigo_municipio_dane"]).isdigit():
-        return False, "codigo_municipio_dane must be numeric"
+    cur.execute(
+        """INSERT INTO fact_atencion_streaming
+               (raw_event_id, location_id, status_id, date_id, total_beneficiarios,
+                event_timestamp, processed_timestamp, processing_delay_seconds)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (raw_event_id) DO NOTHING""",
+        (evento["event_id"], location_id, status_id, date_id,
+         evento["total_beneficiarios"], event_dt, procesado, retardo),
+    )
+    return cur.rowcount == 1   # False -> duplicado ya procesado
+
+
+def persistir_rechazado(cur, evento, raw, motivo, particion, offset):
+    event_id = evento.get("event_id") if isinstance(evento, dict) else None
+    cur.execute(
+        """INSERT INTO rejected_atencion_events
+               (event_id, raw_event, rejection_reason, kafka_partition, kafka_offset)
+           VALUES (%s,%s,%s,%s,%s)""",
+        (str(event_id) if event_id is not None else None, raw, motivo, particion, offset),
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--group", default="icbf-streaming-team", help="group.id de Kafka")
+    ap.add_argument("--from-beginning", action="store_true",
+                    help="si el grupo no tiene offset, empezar por el inicio (earliest); si no, latest")
+    ap.add_argument("--max-events", type=int, default=0, help="terminar tras N mensajes (0 = sin límite)")
+    args = ap.parse_args()
+
+    signal.signal(signal.SIGINT, _senal)
+    signal.signal(signal.SIGTERM, _senal)
 
     try:
-        # Maneja la "Z" de UTC o formatos ISO
-        datetime.fromisoformat(event["event_time"].replace('Z', '+00:00'))
-    except (ValueError, TypeError):
-        return False, "event_time must be a valid ISO timestamp"
+        conn = conectar_pg()
+    except Exception as e:
+        sys.exit(f"❌ No se pudo conectar a PostgreSQL: {e}")
+    init_db(conn)
 
-    # Verificar duplicados
-    cursor.execute("SELECT 1 FROM fact_atencion_streaming WHERE raw_event_id = %s", (event["event_id"],))
-    if cursor.fetchone():
-        return False, f"Duplicate event_id: {event['event_id']}"
+    consumer = Consumer({
+        "bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP", "localhost:9094"),
+        "group.id": args.group,
+        "auto.offset.reset": "earliest" if args.from_beginning else "latest",
+        "enable.auto.commit": False,      # commit manual tras persistir
+    })
+    consumer.subscribe([contract.TOPIC])
+    print(f"📡 Grupo '{args.group}' escuchando '{contract.TOPIC}' (Ctrl+C para detener)\n")
 
-    return True, "Valid event"
-
-def persist_raw_event(event_id, raw_json_str):
-    """Guarda el mensaje de Kafka intacto en la base de datos."""
-    cursor.execute("""
-        INSERT INTO raw_atencion_events (raw_event_id, raw_payload, received_at)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (raw_event_id) DO NOTHING
-    """, (event_id, raw_json_str, datetime.now(timezone.utc).isoformat()))
-
-def persist_valid(event):
-    """Guarda en dimensiones y en la tabla de hechos."""
-    event_dt = datetime.fromisoformat(event["event_time"].replace('Z', '+00:00'))
-    processed_dt = datetime.now(timezone.utc)
-    delay = (processed_dt - event_dt).total_seconds()
-    date_id = int(event_dt.strftime("%Y%m%d")) 
-
-    # 1. Dimensión Fecha
-    cursor.execute("""
-        INSERT INTO dim_streaming_date (date_id, year, month, day)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (date_id) DO NOTHING
-    """, (date_id, event_dt.year, event_dt.month, event_dt.day))
-
-    # 2. Dimensión Ubicación
-    cursor.execute("""
-        INSERT INTO dim_streaming_location (codigo_municipio_dane, departamento, zona)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (codigo_municipio_dane, departamento, zona) DO NOTHING;
-    """, (event["codigo_municipio_dane"], event["departamento"], event["zona"]))
-    
-    cursor.execute("""
-        SELECT location_id FROM dim_streaming_location 
-        WHERE codigo_municipio_dane = %s AND departamento = %s AND zona = %s
-    """, (event["codigo_municipio_dane"], event["departamento"], event["zona"]))
-    location_id = cursor.fetchone()[0]
-
-    # 3. Dimensión Estado
-    cursor.execute("""
-        INSERT INTO dim_streaming_status (estado_atencion)
-        VALUES (%s)
-        ON CONFLICT (estado_atencion) DO NOTHING;
-    """, (event["estado_atencion"],))
-    
-    cursor.execute("SELECT status_id FROM dim_streaming_status WHERE estado_atencion = %s", (event["estado_atencion"],))
-    status_id = cursor.fetchone()[0]
-
-    # 4. Tabla de Hechos
-    cursor.execute("""
-        INSERT INTO fact_atencion_streaming (
-            raw_event_id, location_id, status_id, date_id, 
-            total_beneficiarios, event_timestamp, processed_timestamp, processing_delay_seconds
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        event["event_id"], location_id, status_id, date_id,
-        event["total_beneficiarios"], event_dt.isoformat(), processed_dt.isoformat(), delay
-    ))  
-
-def persist_rejected(event, reason):
-    """Guarda eventos que no cumplen el contrato."""
-    event_id = event.get("event_id") if isinstance(event, dict) else None
-    cursor.execute("""
-        INSERT INTO rejected_atencion_events (event_id, raw_event, rejection_reason, rejected_at)
-        VALUES (%s, %s, %s, %s)
-    """, (
-        event_id, json.dumps(event), reason, datetime.now(timezone.utc).isoformat()
-    ))
-
-# ============================================================
-# BUCLE PRINCIPAL
-# ============================================================
-def start_consumer():
-    init_db()
-    print(f"📡 Esperando eventos en el tópico '{TOPIC}'...\n")
-
+    ok = rechazados = duplicados = 0
+    t0 = time.time()
     try:
-        while True:
+        while not _parar:
             msg = consumer.poll(1.0)
             if msg is None:
                 continue
             if msg.error():
-                print(f"⚠️ Error de Kafka: {msg.error()}")
+                if msg.error().code() != KafkaError._PARTITION_EOF:
+                    print(f"⚠️  Error de Kafka: {msg.error()}")
                 continue
 
-            raw_json_str = msg.value().decode("utf-8")
+            raw = msg.value().decode("utf-8", errors="replace")
+            particion, offset = msg.partition(), msg.offset()
+            try:
+                evento = json.loads(raw)
+            except json.JSONDecodeError:
+                evento = None
+                valido, motivo = False, "JSON inválido"
+            else:
+                valido, motivo = contract.validar(evento)
 
             try:
-                raw_event = json.loads(raw_json_str)
-            except json.JSONDecodeError:
-                persist_rejected(raw_json_str, "Invalid JSON format")
-                continue
+                with conn.cursor() as cur:
+                    if valido:
+                        nuevo = persistir_valido(cur, evento, raw, particion, offset)
+                    else:
+                        persistir_rechazado(cur, evento, raw, motivo, particion, offset)
+                conn.commit()
+            except Exception as e:      # falla de BD: no se confirma offset; se reintentará al reiniciar
+                conn.rollback()
+                print(f"❌ Error de base de datos, se detiene sin confirmar el offset: {e}")
+                break
 
-            # 1. Validar Contrato
-            is_valid, reason = validate_event(raw_event)
+            consumer.commit(message=msg, asynchronous=False)
 
-            if is_valid:
-                # 2. Guardar Crudo
-                persist_raw_event(raw_event["event_id"], raw_json_str)
-                # 3. Guardar Valido (Hechos/Dim)
-                persist_valid(raw_event)
-                print(f"✅ Procesado: {raw_event['event_id']} | Mun: {raw_event['codigo_municipio_dane']} | Ben: {raw_event['total_beneficiarios']}")
+            if valido and nuevo:
+                ok += 1
+                print(f"✅ {evento['event_id']} | mun={evento['codigo_municipio_dane']} "
+                      f"| ben={evento['total_beneficiarios']} | p{particion}@{offset}")
+            elif valido:
+                duplicados += 1
+                print(f"♻️  Duplicado ignorado: {evento['event_id']}")
             else:
-                # 4. Guardar Rechazado (Dead Letter Queue)
-                persist_rejected(raw_event, reason)
-                print(f"❌ Rechazado: {raw_event.get('event_id', 'Unknown')} | Motivo: {reason}")
+                rechazados += 1
+                eid = evento.get("event_id") if isinstance(evento, dict) else "?"
+                print(f"🚫 Rechazado {eid} | motivo: {motivo}")
 
-    except KeyboardInterrupt:
-        print("\n🛑 Deteniendo el consumidor...")
+            if args.max_events and (ok + rechazados + duplicados) >= args.max_events:
+                break
     finally:
         consumer.close()
-        cursor.close()
         conn.close()
+        seg = time.time() - t0
+        print(f"\n🛑 Consumidor detenido. procesados={ok} rechazados={rechazados} "
+              f"duplicados={duplicados} en {seg:.1f}s")
+
 
 if __name__ == "__main__":
-    start_consumer()
+    main()

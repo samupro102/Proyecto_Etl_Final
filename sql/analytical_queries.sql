@@ -1,4 +1,4 @@
-USE icbf_primera_infancia_dw;
+-- PostgreSQL: el DW vive en la base configurada en .env (esquema public)
 
 -- ============================================================
 -- R1: Distribución territorial de beneficiarios entre departamentos
@@ -123,7 +123,7 @@ SELECT
     g.departamento_uds AS departamento,
     SUM(CASE WHEN bp.grupo_etnico = 'INDÍGENA' THEN f.total_beneficiarios ELSE 0 END) AS beneficiarios_indigenas,
     SUM(CASE WHEN bp.presenta_discapacidad = 'SI' THEN f.total_beneficiarios ELSE 0 END) AS beneficiarios_con_discapacidad,
-    SUM(CASE WHEN bp.zona_ubicacion = 'RESTO' THEN f.total_beneficiarios ELSE 0 END) AS beneficiarios_zona_rural,
+    SUM(CASE WHEN z.nombre_zona = 'RESTO' THEN f.total_beneficiarios ELSE 0 END) AS beneficiarios_zona_rural,
     SUM(f.total_beneficiarios) AS total_beneficiarios,
     ROUND(
         100.0 * SUM(CASE WHEN bp.grupo_etnico = 'INDÍGENA' THEN f.total_beneficiarios ELSE 0 END)
@@ -132,5 +132,6 @@ SELECT
 FROM fact_atencion f
 JOIN dim_geography g ON f.geography_key = g.geography_key
 JOIN dim_beneficiary_profile bp ON f.beneficiary_profile_key = bp.beneficiary_profile_key
+JOIN dim_zone z ON f.zone_key = z.zone_key
 GROUP BY g.departamento_uds
 ORDER BY porcentaje_indigena DESC;

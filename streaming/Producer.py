@@ -1,21 +1,3 @@
-"""
-Productor Kafka: replay simulado de fact_atencion como eventos `atencion_reportada`.
-
-Cada evento corresponde a una fila de fact_atencion, unida con sus dimensiones.
-Es una SIMULACIÓN: las filas históricas se mezclan con semilla fija y se publican
-a un ritmo configurable para imitar la llegada de reportes. Cada evento lleva
-simulated=true.
-
-Uso (desde la raíz del proyecto, con el entorno virtual activo):
-    python streaming/producer.py --n 300 --rate 5
-    python streaming/producer.py --n 300 --rate 5 --invalidos 6    # experimento de eventos inválidos
-
-Variables de entorno (.env, nunca versionado):
-    POSTGRES_USER, POSTGRES_PASSWORD, DW_POSTGRES_DB   (ya existen en el .env)
-    STREAM_PG_HOST (def. localhost), STREAM_PG_PORT (def. 5433)
-    KAFKA_BOOTSTRAP (def. localhost:9094)
-"""
-
 import argparse
 import json
 import os
@@ -28,11 +10,9 @@ from pathlib import Path
 
 import pandas as pd
 
-# Constantes del evento. El contrato y su validación viven en el consumidor
-# (consumer.py); aquí solo se construyen los eventos con esa misma forma.
-TOPIC = "icbf.atencion.reportada"
-EVENT_TYPE = "atencion_reportada"
-SCHEMA_VERSION = 1
+# El contrato y su validación viven en streaming/contract.py (fuente única).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from contract import TOPIC, EVENT_TYPE, SCHEMA_VERSION  # noqa: E402
 
 CONSULTA = """
 SELECT f.fact_key,

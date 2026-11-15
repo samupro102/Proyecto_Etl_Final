@@ -130,8 +130,22 @@ def reliable_ods2():
         # 1. Generar el modelo dimensional
         tablas, _ = construir_modelo(df_icbf, df_sisben)
 
-        # 2. Ejecutar la carga recreando las tablas faltantes
-        cargar(tablas, recrear_esquema=True)
+        # 2. El esquema solo se crea si el DW está vacío (primera ejecución).
+        #    En las siguientes corridas la carga es DELETE + INSERT transaccional,
+        #    así un dashboard conectado nunca ve las tablas borradas.
+        #    Para forzar la recreación: variable de entorno DW_RECREATE_SCHEMA=true.
+        import os
+        from sqlalchemy import inspect
+        from src.load import crear_engine
+
+        engine = crear_engine()
+        try:
+            existe = inspect(engine).has_table("fact_atencion")
+        finally:
+            engine.dispose()
+        recrear = (not existe) or os.getenv("DW_RECREATE_SCHEMA", "false").lower() == "true"
+        print(f"Esquema existente: {existe} | recrear_esquema={recrear}")
+        cargar(tablas, recrear_esquema=recrear)
 
         print("¡Carga masiva a PostgreSQL completada con éxito!")
 

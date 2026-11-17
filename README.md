@@ -3,6 +3,7 @@
 **Curso:** ETL (G01) — Ingeniería de Datos e Inteligencia Artificial
 **Fase 1:** De los requerimientos analíticos a un Data Warehouse dimensional (ICBF)
 **Fase 2:** Integración de una segunda fuente (API Sisbén), orquestación con Airflow y carga a PostgreSQL
+**Fase 3:** Streaming con Apache Kafka (productor, consumidor, contrato de eventos) y dashboard en tiempo real, sobre el pipeline batch
 **ODS seleccionado:** ODS 2 — Hambre Cero
 
 ---
@@ -32,6 +33,14 @@
 21. [Registro de cambios (primera → segunda entrega)](#21-registro-de-cambios-primera--segunda-entrega)
 22. [Pruebas de confiabilidad y evidencia](#22-pruebas-de-confiabilidad-y-evidencia)
 23. [Equipo y responsabilidades](#23-equipo-y-responsabilidades)
+24. [Tercera entrega — Streaming con Kafka: visión general](#24-tercera-entrega--streaming-con-kafka-visión-general)
+25. [Contrato de eventos](#25-contrato-de-eventos)
+26. [Pipeline de streaming](#26-pipeline-de-streaming)
+27. [Almacenamiento y métricas de streaming](#27-almacenamiento-y-métricas-de-streaming)
+28. [Dashboard en tiempo real](#28-dashboard-en-tiempo-real)
+29. [Ejecución del streaming (reproducibilidad)](#29-ejecución-del-streaming-reproducibilidad)
+30. [Evidencia funcional del streaming](#30-evidencia-funcional-del-streaming)
+31. [Decisiones de ingeniería y limitaciones del streaming](#31-decisiones-de-ingeniería-y-limitaciones-del-streaming)
 
 ---
 
@@ -772,8 +781,8 @@ zona, muy por debajo del umbral del 1 % (DQ-I2).
 
 ```bash
 # 1. Clonar el repositorio
-git clone https://github.com/Titoelgato0809/Proyecto2.git
-cd Proyecto2
+git clone https://github.com/samupro102/Proyecto_Etl_Final.git
+cd Proyecto_Etl_Final
 
 # 2. Crear el archivo .env en la raíz (nunca se versiona). Variables mínimas:
 #    POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_HOST, POSTGRES_PORT
@@ -814,7 +823,7 @@ docker exec -i postgres psql -U postgres -d postgres < sql/analytical_queries.sq
 ## 20. Estructura del repositorio
 
 ```
-Proyecto2/
+Proyecto_Etl_Final/
 ├── dags/
 │   └── reliable_ods2.py          # DAG de Airflow (orquestación completa)
 ├── src/
@@ -828,8 +837,15 @@ Proyecto2/
 ├── gx/
 │   ├── validate_icbf.py          # Compuerta 1 (DQ-P)
 │   └── validate_sisben.py        # Compuerta 2 (DQ-A)
+├── streaming/                    # Tercera entrega (ver secciones 24–31)
+│   ├── contract.py               # Contrato de eventos y validación
+│   ├── producer.py               # Productor Kafka (replay de fact_atencion)
+│   ├── consumer.py               # Consumidor: valida, persiste y rechaza
+│   └── dashboard.py              # Dashboard Streamlit en tiempo real
+├── tests/                        # Pruebas del contrato y del productor
 ├── sql/
 │   ├── create_dw.sql             # DDL del esquema estrella (10 tablas)
+│   ├── streaming_schema.sql      # Tablas y vistas vw_stream_* (tercera entrega)
 │   └── analytical_queries.sql    # Consultas R1–R5 (R6–R7 en vistas, ver sección 15)
 ├── notebooks/
 │   ├── profile.py                # Perfilamiento ICBF
@@ -865,6 +881,15 @@ Proyecto2/
 8. Infraestructura: motor MySQL → **PostgreSQL**; ejecución manual con `main.py` → **DAG de Airflow**
    con tres compuertas de calidad; carga con `TRUNCATE` → carga transaccional con *advisory lock*,
    reconciliación y `ROLLBACK`.
+
+### Segunda → tercera entrega
+
+1. Nuevo servicio `kafka` (KRaft, 3.8.0) y `kafka-init` en `docker-compose.yaml`; tópico
+   `icbf.atencion.reportada` (3 particiones).
+2. Nuevo paquete `streaming/` (contrato, productor, consumidor, dashboard) y pruebas en `tests/`.
+3. Nuevo `sql/streaming_schema.sql`: tablas `*_streaming`, cola de rechazados y vistas `vw_stream_*`.
+4. `requirements.txt`: se añade `confluent-kafka`; el dashboard requiere además `streamlit` (y `pytest` para las pruebas).
+5. El pipeline batch (DAG `reliable_ods2`, compuertas de GX, esquema estrella) **no cambia**.
 
 ## 22. Pruebas de confiabilidad y evidencia
 
@@ -930,6 +955,9 @@ Se ejecuta el DAG `reliable_ods2` completo con un lote que cumple la política C
 | Reejecución segura | Sección 22.3 |
 | Dashboard y trazabilidad a KPI | Sección 16 |
 | Trazabilidad extremo a extremo | Sección 12.1 |
+| Contrato de eventos, Kafka y consumidor | Secciones 25–26, `streaming/` |
+| Métricas y dashboard en tiempo real | Secciones 27–28 |
+| Experimentos de evento inválido e interrupción | Sección 30 |
 
 ## 23. Equipo y responsabilidades
 
@@ -938,6 +966,308 @@ Se ejecuta el DAG `reliable_ods2` completo con un lote que cumple la política C
 | **Saith Gurrute** | Extracción de la API del Sisbén (`src/extract_sisben.py`). Validaciones posteriores a la extracción (compuertas crudas con Great Expectations). Diseño de los DAGs de Airflow. Configuración del `docker-compose.yaml`. Apoyo en la carga (`src/load.py`) |
 | **Samuel Arboleda** | Modificación de la transformación (`src/transform.py`). Validaciones de la transformación (compuerta 3, `src/validation.py`). Desarrollo principal de la carga (`src/load.py`). Dashboard en Power BI |
 | **Ambos** | Perfilamiento de las fuentes y análisis de sus resultados |
+
+## 24. Tercera entrega — Streaming con Kafka: visión general
+
+La tercera entrega añade al pipeline batch (secciones 1–23, sin cambios) una **segunda vía de datos en
+tiempo real**: los hechos de atención del ICBF se publican como eventos en Apache Kafka, un consumidor
+los valida contra un contrato, los guarda en PostgreSQL y un dashboard los muestra actualizándose solo.
+
+### 24.1 Objetivo del streaming
+
+Demostrar que el mismo dominio (atención del ICBF a la primera infancia, ODS 2) puede observarse **a
+medida que llegan los datos**, con garantías de calidad (contrato de eventos, rechazo de eventos
+inválidos) y de entrega (sin pérdidas ni duplicados), además de la mirada histórica del batch.
+
+### 24.2 Batch vs. streaming
+
+| Aspecto | Batch (entregas 1–2) | Streaming (entrega 3) |
+|---|---|---|
+| Fuente | CSV del ICBF + API Sisbén | Tópico Kafka `icbf.atencion.reportada` |
+| Disparo | DAG `reliable_ods2` en Airflow (`@daily`) | Consumidor siempre activo |
+| Latencia | Horas (corrida completa) | Segundos (evento a evento) |
+| Calidad | Great Expectations, 3 compuertas | Contrato de eventos (`streaming/contract.py`) |
+| Fallas | La tarea falla y **no se carga** | El evento se envía a la tabla de rechazados |
+| Destino | Esquema estrella (`fact_atencion`, …) | Tablas `*_streaming` y vistas `vw_stream_*` |
+| Visualización | Power BI (sección 16) | Streamlit con refresco automático (sección 28) |
+| Pregunta que responde | ¿Cómo está la atención, histórica y comparada con la población vulnerable? | ¿Qué está llegando ahora y con qué calidad? |
+
+> **Simulación declarada.** El ICBF no publica eventos en vivo. Los eventos son un *replay* de filas
+> reales de `fact_atencion` ya cargadas al DW, marcados con `simulated: true`. Las métricas de streaming
+> describen el comportamiento del pipeline, no atenciones nuevas reales.
+
+### 24.3 Arquitectura con Kafka
+
+```
+ fact_atencion + dimensiones (DW)            Producer  (streaming/producer.py)
+          │  muestra reproducible (--seed)        │  acks=all · idempotente · llave = codigo_municipio_dane
+          └──────────────────────────────────────►│
+                                                  ▼
+                            Kafka (apache/kafka 3.8.0, KRaft, 1 broker)
+                            tópico icbf.atencion.reportada · 3 particiones · RF 1
+                                                  │
+                                                  ▼
+                       Consumer  (streaming/consumer.py · grupo icbf-streaming-team)
+                       valida contrato ─┬─ válido ──► raw_atencion_events + fact_atencion_streaming
+                                        └─ inválido ► rejected_atencion_events (dead letter)
+                       commit de offset SOLO después del commit en PostgreSQL
+                                                  │
+                                                  ▼
+                       PostgreSQL · vistas vw_stream_*  ──►  Dashboard Streamlit (streaming/dashboard.py)
+```
+
+> El diagrama `docs/architecture.png` corresponde a la segunda entrega; el esquema de arriba es el vigente
+> para la tercera.
+
+## 25. Contrato de eventos
+
+Definido en [`streaming/contract.py`](streaming/contract.py), fuente única para productor y consumidor
+(versión de esquema `1`). Los eventos son JSON UTF-8.
+
+| Campo | Tipo | Regla |
+|---|---|---|
+| `event_id` | string | Identificador único: `<replay_id>-<fact_key>`; no vacío |
+| `event_type` | string | Constante `atencion_reportada` |
+| `schema_version` | entero | Debe ser `1` |
+| `event_time` | string | ISO 8601 **con zona horaria** (instante de publicación) |
+| `simulated` | booleano | `true`: replay de datos históricos |
+| `fact_key` | entero | `fact_key` de `fact_atencion` en el DW |
+| `codigo_municipio_dane` | string | 5 dígitos; **llave del mensaje** |
+| `departamento` | string | No vacío |
+| `zona` | string | `CABECERA`, `RESTO` o `SIN INFORMACIÓN` |
+| `estado_atencion` | string | `A` (activo) o `I` (inactivo) |
+| `total_beneficiarios` | entero | ≥ 0 |
+
+Ejemplo:
+
+```json
+{"event_id": "r20261116T180500-123456", "event_type": "atencion_reportada", "schema_version": 1,
+ "event_time": "2026-11-16T18:05:01.123456+00:00", "simulated": true, "fact_key": 123456,
+ "codigo_municipio_dane": "44001", "departamento": "LA GUAJIRA", "zona": "RESTO",
+ "estado_atencion": "A", "total_beneficiarios": 42}
+```
+
+`validar(evento)` devuelve `(True, "ok")` o `(False, motivo)` y nunca lanza excepciones. Un booleano
+**no** se acepta donde se espera un entero (en Python `bool` es subclase de `int`).
+
+**Por qué la llave es el municipio.** Kafka garantiza orden por partición; con `codigo_municipio_dane`
+como llave, todos los eventos de un municipio van a la misma partición y se procesan en orden relativo.
+
+## 26. Pipeline de streaming
+
+### 26.1 Infraestructura
+
+Definida en [`docker-compose.yaml`](docker-compose.yaml):
+
+| Elemento | Valor |
+|---|---|
+| Imagen / contenedor | `apache/kafka:3.8.0` / `kafka` (modo KRaft, un solo nodo) |
+| Listeners | `INTERNAL kafka:9092` (entre contenedores) y `EXTERNAL localhost:9094` (desde el anfitrión) |
+| Tópico | `icbf.atencion.reportada`, 3 particiones, factor de replicación 1, retención 7 días |
+| Creación del tópico | Servicio `kafka-init` (la creación automática está desactivada) |
+| Salud | `healthcheck` del broker; `kafka-init` espera a `service_healthy` |
+
+### 26.2 Productor — `streaming/producer.py`
+
+- Lee `fact_atencion` y sus dimensiones del DW y toma una muestra reproducible (`--seed`).
+- Publica con `acks=all` y `enable.idempotence=true`; la llave es `codigo_municipio_dane`.
+- `event_time` se asigna en el instante de publicación; `event_id = <replay_id>-<fact_key>`.
+- Reporta un resumen: publicados, confirmados por Kafka, distribución por partición y beneficiarios.
+- `--invalidos N` inyecta eventos que violan el contrato a propósito (ver sección 30).
+
+| Parámetro | Por defecto | Descripción |
+|---|---|---|
+| `--n` | 300 | Eventos válidos a publicar |
+| `--rate` | 2 | Eventos por segundo |
+| `--seed` | 42 | Semilla del muestreo |
+| `--replay-id` | fecha-hora UTC | Identificador del replay |
+| `--invalidos` | 0 | Eventos inválidos a inyectar |
+
+### 26.3 Consumidor — `streaming/consumer.py`
+
+1. Se une al grupo `icbf-streaming-team` y crea (si no existen) el esquema y las vistas de
+   [`sql/streaming_schema.sql`](sql/streaming_schema.sql).
+2. Por cada mensaje: decodifica JSON → valida con `contract.validar`.
+3. Una transacción por evento: si es válido, inserta en `raw_atencion_events`, dimensiones de streaming y
+   `fact_atencion_streaming`; si no, inserta en `rejected_atencion_events` con el motivo.
+4. **Solo después del `COMMIT` en PostgreSQL** confirma el offset en Kafka (`enable.auto.commit=false`).
+5. Un `event_id` repetido se ignora (`ON CONFLICT DO NOTHING`) y se cuenta como duplicado.
+
+Garantía resultante: **entrega al menos una vez + escritura idempotente = efectivamente una vez**. Si el
+consumidor cae entre el `COMMIT` y la confirmación del offset, Kafka reentrega el mensaje y la base lo
+descarta como duplicado. Si la base falla, el consumidor se detiene **sin** confirmar el offset y el
+evento se reintenta al reiniciar.
+
+Opciones: `--group` (grupo), `--from-beginning` (si el grupo no tiene offset, empezar por el inicio; por
+defecto `latest`), `--max-events` (terminar tras N mensajes).
+
+## 27. Almacenamiento y métricas de streaming
+
+Las tablas viven en la misma base del DW pero **separadas** del esquema estrella batch.
+
+| Tabla | Contenido |
+|---|---|
+| `raw_atencion_events` | Mensaje original intacto, partición y offset |
+| `dim_streaming_location` | Municipio DANE, departamento y zona |
+| `dim_streaming_status` | Estado de atención |
+| `dim_streaming_date` | Fecha del evento |
+| `fact_atencion_streaming` | Un registro por evento válido; `raw_event_id` único; retardo de procesamiento |
+| `rejected_atencion_events` | Eventos inválidos, motivo, partición y offset (*dead letter*) |
+
+**Métricas de streaming (vistas `vw_stream_*`):**
+
+| # | Vista | Métrica | Uso |
+|---|---|---|---|
+| M1 | `vw_stream_kpis` | Eventos procesados, **beneficiarios acumulados**, retardo promedio/máximo, **eventos rechazados** y % de rechazo | Tarjetas |
+| M2 | `vw_stream_beneficiarios_departamento` | Eventos y beneficiarios por departamento | Barras (top 10) |
+| M3 | `vw_stream_throughput_minuto` | Eventos, beneficiarios y retardo por minuto | Línea de tiempo |
+| M4 | `vw_stream_zona_estado` | Beneficiarios por zona (cabecera/resto) y estado | Distribución |
+| M5 | `vw_stream_rechazos_motivo` | Rechazos por motivo | Tabla de calidad |
+
+Resumen de las tres métricas principales exigidas: beneficiarios acumulados (M1), eventos inválidos y %
+de rechazo (M1, M5) y latencia de procesamiento (M1, M3).
+
+## 28. Dashboard en tiempo real
+
+[`streaming/dashboard.py`](streaming/dashboard.py) es una app **Streamlit** que consulta las vistas
+`vw_stream_*` y se refresca sola (control lateral de 1 a 30 s; por defecto 3 s). Muestra:
+
+- Tarjetas: eventos procesados, beneficiarios acumulados, retardo promedio y rechazados (con %).
+- Beneficiarios por departamento (top 10) y eventos por minuto.
+- Tabla de rechazos por motivo.
+- Leyenda de que los eventos son un replay simulado.
+
+Cuando el productor publica, los contadores y gráficos cambian sin recargar la página; si se inyectan
+eventos inválidos, sube el contador de rechazados y aparece el motivo en la tabla.
+
+> **Herramientas por tipo de dashboard:** el dashboard *batch* (histórico) está en Power BI (sección 16);
+> el de *tiempo real* está en Streamlit porque necesita refresco continuo sobre PostgreSQL.
+
+_[Insertar captura: `docs/evidencia/dashboard_streaming_antes.png` y `..._despues.png`]_
+
+## 29. Ejecución del streaming (reproducibilidad)
+
+Requisitos: haber ejecutado el DAG batch (el DW debe tener `fact_atencion` cargada) y tener el `.env`
+de la sección 19.
+
+```bash
+# 1. Infraestructura (PostgreSQL, Kafka y creación automática del tópico)
+docker compose up -d postgres kafka kafka-init
+
+# 2. Dependencias
+pip install -r requirements.txt            # incluye confluent-kafka
+pip install streamlit pytest               # dashboard y pruebas
+
+# 3. Terminal A — consumidor
+python streaming/consumer.py --from-beginning
+
+# 4. Terminal B — productor (válidos + 4 inválidos de prueba)
+python streaming/producer.py --n 100 --rate 2 --invalidos 4
+
+# 5. Terminal C — dashboard
+streamlit run streaming/dashboard.py       # http://localhost:8501
+
+# Pruebas unitarias del contrato y del productor
+pytest tests -q
+```
+
+En Windows/PowerShell use `\` en las rutas (`python streaming\consumer.py`). Variables opcionales:
+`KAFKA_BOOTSTRAP` (por defecto `localhost:9094`), `STREAM_PG_HOST` (`localhost`) y `STREAM_PG_PORT`
+(`5433`). Verificación rápida:
+
+```bash
+docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic icbf.atencion.reportada
+docker exec -it postgres psql -U postgres -d postgres -c "SELECT * FROM vw_stream_kpis;"
+```
+
+## 30. Evidencia funcional del streaming
+
+### 30.1 Experimento A — eventos inválidos
+
+El productor mezcla eventos que violan el contrato a propósito (`--invalidos 4`), uno por cada tipo:
+
+| Tipo | Violación | Motivo esperado en `rejected_atencion_events` |
+|---|---|---|
+| 0 | Falta `total_beneficiarios` | `Campo obligatorio ausente: total_beneficiarios` |
+| 1 | `codigo_municipio_dane = "ABC"` | `codigo_municipio_dane debe tener 5 dígitos` |
+| 2 | `total_beneficiarios = -5` | `total_beneficiarios no puede ser negativo` |
+| 3 | `zona = "ZONA_DESCONOCIDA"` | `zona fuera de dominio: ZONA_DESCONOCIDA` |
+
+Comprobación:
+
+```sql
+SELECT event_id, rejection_reason, kafka_partition, kafka_offset FROM rejected_atencion_events ORDER BY id DESC;
+SELECT * FROM vw_stream_rechazos_motivo;
+```
+
+Resultado esperado: el consumidor imprime `🚫 Rechazado …`, los inválidos **no** aparecen en
+`fact_atencion_streaming` y el dashboard incrementa «Rechazados».
+
+| Evidencia | Archivo |
+|---|---|
+| Salida del productor con los eventos inyectados | _[`docs/evidencia/prod_invalidos.png`]_ |
+| Salida del consumidor con rechazos | _[`docs/evidencia/cons_rechazos.png`]_ |
+| Tabla `rejected_atencion_events` | _[`docs/evidencia/tabla_rechazados.png`]_ |
+| Dashboard con rechazados > 0 | _[`docs/evidencia/dash_rechazados.png`]_ |
+
+### 30.2 Experimento B — interrupción del consumidor
+
+1. Consumidor y productor en marcha (`--n 200 --rate 2`); anote `eventos_procesados` en el dashboard.
+2. Detenga el consumidor con `Ctrl+C` mientras el productor sigue publicando.
+3. Espere ~20 s: el dashboard **deja de cambiar**; Kafka acumula los mensajes (retraso en el grupo):
+
+   ```bash
+   docker exec -it kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group icbf-streaming-team
+   ```
+4. Reinicie el consumidor con el **mismo grupo** (`python streaming/consumer.py`). Retoma desde el último
+   offset confirmado y procesa el retraso acumulado.
+5. Verifique que no hay pérdida ni duplicados:
+
+   ```sql
+   SELECT COUNT(*) AS filas, COUNT(DISTINCT raw_event_id) AS ids_unicos FROM fact_atencion_streaming;
+   ```
+
+Resultado esperado: `filas = ids_unicos` y el total coincide con los eventos válidos publicados.
+
+| Medición | Valor |
+|---|---|
+| Eventos válidos publicados | _[completar]_ |
+| Procesados antes de la interrupción | _[completar]_ |
+| Retraso del grupo durante la caída | _[completar]_ |
+| Filas / ids únicos tras recuperar | _[completar]_ |
+
+_[Capturas: `docs/evidencia/consumer_detenido.png`, `lag_grupo.png`, `consumer_recuperado.png`]_
+
+> Evidencia de la entrega: el productor de prueba confirmó 20 de 20 eventos publicados en Kafka
+> (`confirmados por Kafka: 20`).
+
+## 31. Decisiones de ingeniería y limitaciones del streaming
+
+**Decisiones**
+
+1. **Replay simulado de datos reales** en lugar de datos sintéticos: conserva coherencia con el DW y se
+   declara con `simulated: true`.
+2. **Contrato único en `contract.py`**, usado por productor y consumidor, con pruebas unitarias.
+3. **Commit manual de offset tras el commit en BD**: prioriza no perder eventos; los duplicados se
+   absorben con `event_id` único.
+4. **Cola de rechazados en base de datos** (*dead letter*) para auditar por qué se descartó cada evento.
+5. **Esquema de streaming separado del estrella batch**: el streaming no modifica `fact_atencion` ni
+   interfiere con la carga transaccional del DAG.
+6. **Tópico creado por `kafka-init`** con la creación automática desactivada: infraestructura
+   reproducible y sin tópicos accidentales.
+7. **Streamlit para tiempo real, Power BI para histórico**: cada herramienta según su fortaleza.
+
+**Limitaciones**
+
+- Un solo broker y factor de replicación 1: no hay tolerancia a fallas del broker (aceptable para
+  demostración).
+- Un solo consumidor activo: las 3 particiones no se aprovechan en paralelo; escalar requiere más
+  instancias del mismo grupo.
+- Los eventos son simulados; las métricas no representan atenciones nuevas reales.
+- El broker no tiene volumen persistente: si se recrea el contenedor se pierden los mensajes (`kafka-init`
+  recrea el tópico).
+- Sin autenticación ni cifrado (PLAINTEXT), solo para entorno local.
+- El dashboard consulta la base por *polling* cada pocos segundos; no es un *push* verdadero.
 
 ---
 

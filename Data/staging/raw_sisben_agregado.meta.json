@@ -1,6 +1,6 @@
 {
-  "batch_id": "sisben_20261111T030850Z",
-  "extraido_en_utc": "2026-11-11T03:09:05.781840+00:00",
+  "batch_id": "sisben_20261115T202330Z",
+  "extraido_en_utc": "2026-11-15T20:23:38.681731+00:00",
   "endpoint": "https://www.datos.gov.co/resource/hq2v-5umk.json",
   "consulta": {
     "$select": "cod_mpio, zona, grupo, corte, sum(fex) as sum_fex, count(*) as count",
